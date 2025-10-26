@@ -1,0 +1,845 @@
+//@version=6
+indicator("MTF MACD + RSI (Nikko) v1 Private", overlay=false, max_lines_count=500, calc_bars_count=5000)
+
+max_bars_back(time,500)
+
+// persistent toggle with a small, unobtrusive button
+// Toggle switch
+showMACD = input.bool(true, "Show MACD (Uncheck for RSI)", tooltip="Toggle between MACD and RSI")
+
+// bottom-left status pill (single-line call, red for MACD, green for RSI)
+var label __modeLabel = na
+if barstate.islast
+    if not na(__modeLabel)
+        label.delete(__modeLabel)  
+    status_y = showMACD ? -120.0 : 5.0
+    __modeLabel := label.new(bar_index, status_y, showMACD ? "MACD" : "RSI", style=label.style_label_left, textcolor=color.white, color=showMACD ? color.new(color.red, 0) : color.new(color.green, 0), yloc=yloc.price, xloc=xloc.bar_index, size=size.tiny)
+
+neg_scale = 0.5  // Negative histogram intensity scaling
+
+// === GLOBAL FUNCTIONS ===
+// --- Foreground color intensity based on histogram magnitude
+get_intensity(val, pos_max, neg_min) =>
+    intensity_pos = val>0 ? math.round(math.min(1.0, val/pos_max)*255) : 0
+    intensity_neg = val<0 ? math.round(math.min(1.0, math.abs(val)/math.abs(neg_min))*255*neg_scale) : 0
+    intensity = val>0 ? intensity_pos : (val<0 ? intensity_neg : 0)
+    math.max(0, math.min(255, intensity))
+
+
+// ~~ Heatmap Function {
+getHeatColor(float val, int trendDir, int levelsInp, int heatThresh, color weakbullish, color strongbullish, color weakbearish, color strongbearish, series float high_ser = high, series float low_ser = low, bool pointMode = false) =>
+    series float source = high_ser
+    float hi = ta.highest(pointMode ? source : high_ser, 100)
+    float lo = ta.lowest(pointMode ? source : low_ser, 100)
+    float rng = hi - lo
+    float step = rng > 0 ? rng / levelsInp : na
+
+    color coldTrendCol = trendDir == 1 ? weakbullish : weakbearish
+    color hotTrendCol = trendDir == 1 ? weakbullish : weakbearish
+
+    var array<float> levelVals = array.new<float>(101, na)
+    var array<color> levelColors = array.new<color>(101, na)
+    var array<int> levelCounts = array.new<int>(101, na)
+
+    if na(step) or step == 0
+        na
+    else
+        for i = 0 to levelsInp - 1 by 1
+            float lvl = lo + step * i
+            if pointMode
+                lvl := lo + step * (i + 0.5)
+                lvl
+            int cnt = 0
+            for j = 0 to 100 - 1 by 1
+                bool touch = false
+                if pointMode
+                    touch := source[j] >= lvl - step / 2 and source[j] < lvl + step / 2
+                    touch
+                else
+                    touch := high_ser[j] >= lvl and low_ser[j] <= lvl
+                    touch
+                if touch
+                    cnt := cnt + 1
+                    cnt
+            color col = color.from_gradient(cnt, heatThresh, heatThresh + 10, color.new(coldTrendCol, 80 - cnt), hotTrendCol)
+            array.set(levelVals, i, lvl)
+            array.set(levelColors, i, col)
+            array.set(levelCounts, i, cnt)
+
+        for i = levelsInp to 100 by 1
+            array.set(levelVals, i, na)
+            array.set(levelColors, i, na)
+            array.set(levelCounts, i, na)
+
+        float minD = 1e10
+        color best = na
+        for k = 0 to levelsInp - 1 by 1
+            float lvl = array.get(levelVals, k)
+            if not na(lvl)
+                float d = math.abs(val - lvl)
+                if d < minD
+                    minD := d
+                    best := array.get(levelColors, k)
+                    best
+        best
+        //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+
+
+// ===== MACD BLOCK =====
+
+//indicator(title="MTF MACD(Nikko) 3.8 Private", shorttitle="MTF MACD", overlay=false)
+// Range trendline by © Zeiierman
+// ================= INPUTS =================
+
+// MACD settings
+fast_length    = input.int(12, "Fast Length")
+slow_length    = input.int(26, "Slow Length")
+src            = input(close, "Source")
+signal_length  = input.int(9, "Signal Smoothing")
+
+// Timeframes for multi-timeframe analysis
+tf_15m = input.timeframe("15", "15m Timeframe")
+tf_1h  = input.timeframe("60", "1H Timeframe")
+tf_1d  = input.timeframe("1D", "1D Timeframe")
+tf_1w  = input.timeframe("1W", "1W Timeframe")
+//exit_histogram_thresold  = input.float(110.0, "Exit trade based on histogram threashold")
+// adjust in the settings to optimize the exit point of the ema above or below the 0 line
+exit_ema_thresold  = input.float(0.0, "Exit EMA threashold (ajust to coin)")
+
+// Enable/disable each timeframe
+enable_15m = input.bool(false, "Enable 15m Background")
+enable_1h  = input.bool(true, "Enable 1H")
+enable_1d  = input.bool(true, "Enable 1D")
+enable_1w  = input.bool(true, "Enable 1W")
+enable_background = input.bool(true, "Enable Background")
+enable_drawbuybox = input.bool(true, "Draw Buy Box")
+enable_trendbox = input.bool(false, "Draw Trendbox")
+enable_rangeosc = input.bool(false, "Draw Range Oscillator")
+
+// Visual settings
+buysell_linewidth  = input.int(5, "Buy/Sell Line Width")
+ema_linewidth      = input.int(3, "EMA Line Width")
+buysell_offset     = input.float(1.5, "Buy Sell signals offset up and down")
+lookback           = input.int(50, "Signal Lookback (the longer the smoother)")
+
+threshold_low      = input.float(1.0, "Lower Threshold (%)")
+threshold_high     = input.float(90.0, "Upper Threshold (%)")
+signal_lookback    = input.int(50, "Lookback Period")
+Background_transparency = input.int(75, "Background Transparency (%)")
+
+// Toggle shapes
+show_threshold_shapes = input.bool(true, "Show Threshold Buy/Sell Shapes")
+show_rsi_div          = input.bool(true, "Show RSI Divergence Shapes")
+
+    // ================= CALCULATIONS =================
+
+// --- MACD calculations for multiple timeframes
+[macd_15m, signal_15m, _] = request.security(syminfo.tickerid, tf_15m, [ta.ema(src, fast_length)-ta.ema(src, slow_length), ta.ema(ta.ema(src, fast_length)-ta.ema(src, slow_length), signal_length), 0], lookahead=barmerge.lookahead_on)
+[macd_1h, signal_1h, _]  = request.security(syminfo.tickerid, tf_1h,  [ta.ema(src, fast_length)-ta.ema(src, slow_length), ta.ema(ta.ema(src, fast_length)-ta.ema(src, slow_length), signal_length), 0], lookahead=barmerge.lookahead_on)
+[macd_1d, signal_1d, _]  = request.security(syminfo.tickerid, tf_1d,  [ta.ema(src, fast_length)-ta.ema(src, slow_length), ta.ema(ta.ema(src, fast_length)-ta.ema(src, slow_length), signal_length), 0], lookahead=barmerge.lookahead_on)
+[macd_1w, signal_1w, _]  = request.security(syminfo.tickerid, tf_1w,  [ta.ema(src, fast_length)-ta.ema(src, slow_length), ta.ema(ta.ema(src, fast_length)-ta.ema(src, slow_length), signal_length), 0], lookahead=barmerge.lookahead_on)
+
+// --- Compute histogram values for each timeframe
+hist_15m = (macd_15m - signal_15m)/3.0
+hist_1h  = (macd_1h - signal_1h)/3.0
+hist_1d  = (macd_1d - signal_1d)/3.0
+hist_1w  = (macd_1w - signal_1w)/3.0
+
+// --- Background gradient color for 15m histogram
+var color background_color = color.black
+transparent_background_color= color.new(background_color, 100)
+if enable_15m
+    hist_min = ta.lowest(hist_15m, lookback)
+    hist_max = ta.highest(hist_15m, lookback)
+    norm_value = (hist_15m - hist_min)/math.max(hist_max-hist_min, 1e-10)
+    norm_value := math.min(math.max(norm_value, 0), 1)
+    r_val = math.round(255*(1-norm_value))
+    g_val = math.round(255*norm_value)
+    background_color := color.rgb(r_val, g_val, 0, Background_transparency)
+    transparent_background_color := color.new(background_color, Background_transparency) 
+    
+
+bgcolor(transparent_background_color)
+
+// --- Compute positive/negative intensity for each higher timeframe
+pos_max_1h = math.max(ta.highest(hist_1h, lookback), 1e-10)
+neg_min_1h = math.min(ta.lowest(hist_1h, lookback), -1e-10)
+pos_max_1d = math.max(ta.highest(hist_1d, lookback), 1e-10)
+neg_min_1d = math.min(ta.lowest(hist_1d, lookback), -1e-10)
+pos_max_1w = math.max(ta.highest(hist_1w, lookback), 1e-10)
+neg_min_1w = math.min(ta.lowest(hist_1w, lookback), -1e-10)
+
+blue_intensity  = enable_1h ? get_intensity(hist_1h, pos_max_1h, neg_min_1h) : 0
+green_intensity = enable_1d ? get_intensity(hist_1d, pos_max_1d, neg_min_1d) : 0
+red_intensity   = enable_1w ? get_intensity(hist_1w, pos_max_1w, neg_min_1w) : 0
+
+color_1h = color.rgb(0,0,blue_intensity)
+color_1d = color.rgb(0,green_intensity,0)
+color_1w = color.rgb(red_intensity,0,0)
+final_color = color.rgb(red_intensity, green_intensity, blue_intensity)
+
+// --- Calculate bullish percentage across multiple timeframes
+bullish_count = (enable_1h and hist_1h>=0?1:0) + (enable_1d and hist_1d>=0?1:0) + (enable_1w and hist_1w>=0?1:0)
+bullish_total = (enable_1h?1:0)+(enable_1d?1:0)+(enable_1w?1:0)
+bullish_pct = bullish_total>0 ? (bullish_count/bullish_total)*100 : 0
+bullish_pct := math.min(math.max(bullish_pct,0),100)
+
+// --- MACD for current timeframe
+macd_current = ta.ema(src,fast_length)-ta.ema(src,slow_length)
+signal_current = ta.ema(macd_current, signal_length)
+hist_current = macd_current - signal_current
+ema_hist = ta.ema(hist_current, signal_length)
+
+// --- Scale values between -100 to +100
+hist_min = ta.lowest(hist_current, lookback)
+hist_max = ta.highest(hist_current, lookback)
+max_abs_range = math.max(math.abs(hist_max), math.abs(hist_min), 1e-10)
+macd_scaled   = (macd_current / max_abs_range) * 100
+signal_scaled = (signal_current / max_abs_range) * 100
+hist_scaled   = (hist_current / max_abs_range) * 100
+ema_scaled    = (ema_hist / max_abs_range) * 100 * 3
+
+//exit_histogram=false
+//if hist_scaled> exit_histogram_thresold
+//    exit_histogram:=true
+
+// --- Plot MACD components
+hline(showMACD ? 0:na ,"Zero Line", color=color.new(#3a3a3a, 50), linestyle=hline.style_dotted)
+plot(showMACD ? hist_scaled:na, style=plot.style_columns, color=final_color, title="Histogram")
+plot(showMACD ? ema_scaled:na, color=final_color, linewidth=ema_linewidth, title="EMA of Histogram")
+plot(showMACD ? macd_scaled:na , color=#2962FF, title="MACD")
+plot(showMACD ? signal_scaled:na , color=#FF6D00, title="Signal")
+
+// --- Compute vertical offset for buy/sell signals
+offset_amt = ta.atr(14) * buysell_offset
+
+// --- Threshold dots (optional)
+buy_signal = show_threshold_shapes and bullish_pct > threshold_high ? high+offset_amt : na
+sell_signal = show_threshold_shapes and bullish_pct < threshold_low ? low-offset_amt : na
+// plot the threshold dots 
+plot(showMACD  ?buy_signal:na, title="Buy Signal", style=plot.style_linebr, linewidth=buysell_linewidth, offset=0,color=final_color, force_overlay=true)
+plot(showMACD ?sell_signal:na, title="Sell Signal", style=plot.style_linebr, linewidth=buysell_linewidth, offset=0, color=final_color, force_overlay=true)
+
+// --- Alerts for threshold crosses
+alertcondition(bullish_pct < threshold_low,  title="Bearish Alert", message="MACD bullish % below threshold")
+alertcondition(bullish_pct > threshold_high, title="Bullish Alert", message="MACD bullish % above threshold")
+
+// === EMA Cross Detection & Coloring ===
+ema_cross_up   = ta.crossover(ema_scaled, 0)
+ema_cross_down = ta.crossunder(ema_scaled+exit_ema_thresold, 0)
+ema_above_color = color.yellow
+ema_below_color = color.new(color.gray, 30)
+ema_color = ema_scaled > 0 ? ema_above_color : ema_below_color
+
+// Plot EMA with dynamic color
+plot(showMACD ? ema_scaled:na, color=ema_color, linewidth=ema_linewidth, title="EMA of Histogram (colored)")
+
+// Alerts for EMA crosses
+alertcondition(showMACD and ema_cross_up,   title="EMA Cross Above Zero", message="EMA of Histogram crossed ABOVE zero (turned yellow).")
+alertcondition(showMACD and ema_cross_down, title="EMA Cross Below Zero", message="EMA of Histogram crossed BELOW zero (no longer yellow).")
+
+// === Entry/Exit Guessing ===
+// Inputs for risk management
+tp_pct         = input.float(3.0, "Take Profit (%)", step=0.1)
+sl_pct         = input.float(1.5, "Stop Loss (%)", step=0.1)
+trail_atr_mult = input.float(2.0, "Trailing Stop ATR Multiplier", step=0.1)
+entry_offset   = input.float(1.5, "Entry symbol vertical offset (ATR fraction)", step=0.1)
+buybox_color    = input.color(color.rgb(50, 150, 255, 50), title="", group="Trend Step Signals", inline="c3", tooltip="")
+border_buybox_color    = input.color(color.rgb(92, 132, 253, 10), title="", group="Trend Step Signals", inline="c3", tooltip="")
+
+// --- Entry condition using EMA + higher timeframe confirmation
+higher_bullish_count = (enable_1h and hist_1h > 0 ? 1 : 0) + (enable_1d and hist_1d > 0 ? 1 : 0) + (enable_1w and hist_1w > 0 ? 1 : 0)
+higher_bullish_majority = higher_bullish_count >= 2
+short_confirm = hist_15m > 0
+ema_rising_recent = ta.valuewhen(ema_scaled > ema_scaled[1], ema_scaled, 0) > ema_scaled[1]
+short_confirm_recent = ta.highest(hist_15m, 2) > 0
+higher_bullish_majority_recent = higher_bullish_count >= 2
+entry_condition = ema_cross_up and ema_rising_recent and short_confirm_recent and higher_bullish_majority_recent
+
+// --- Trade state variables
+var float entry_price = na
+var float trail_stop  = na
+var int   entry_bar   = na
+atr14 = ta.atr(14)
+
+// --- Trigger entry
+if entry_condition and na(entry_price)
+    entry_price := close
+    trail_stop := close - atr14 * trail_atr_mult
+    entry_bar := bar_index
+
+// --- Update trailing stop
+if not na(entry_price)
+    trail_stop := math.max(trail_stop, close - atr14 * trail_atr_mult)
+
+// --- TP & SL
+tp_price = na(entry_price) ? na : entry_price * (1 + tp_pct / 100)
+sl_price = na(entry_price) ? na : entry_price * (1 - sl_pct / 100)
+
+// --- Exit conditions
+exit_by_ema   = ema_cross_down
+exit_by_tp    = not na(tp_price) and close >= tp_price
+exit_by_sl    = not na(sl_price) and close <= sl_price
+exit_by_trail = not na(trail_stop) and close < trail_stop
+// EMA is decreasing for last 3 bars
+ema_down_3bars = ema_scaled < ema_scaled[1] and ema_scaled[1] < ema_scaled[2] and ema_scaled[2] < ema_scaled[3]
+// EMA is decreasing for last 3 bars
+exit_by_ema_peak = ema_down_3bars
+exit_condition = (not na(entry_price)) and (exit_by_ema or exit_by_tp or exit_by_sl or exit_by_trail )
+
+// --- Plot entry label
+offset = atr14 * entry_offset
+if entry_condition and showMACD 
+    label.new(bar_index, low - offset, "BUY", style=label.style_label_up, color=buybox_color,textcolor=color.white, size=size.normal, yloc=yloc.price, tooltip="EMA + 4TF Uptrend Confirmed", force_overlay=true)
+
+// Alerts for entry/exit
+alertcondition(entry_condition, title="MTF MACD BUY Signal", message="BUY: EMA crossed up and 4TF confirm.")
+alertcondition(exit_condition,  title="MTF MACD SELL Signal", message="SELL: EMA down or TP/SL/Trail/EMA/Histo Threshold exit.")
+
+// --- Reset trade state on exit
+if exit_condition
+    entry_price := na
+    trail_stop := na
+    entry_bar := na
+
+// === EMA Trend Zone Box on Main Chart ===
+var box uptrend_box = na
+var float entry_price_main = na
+var float exit_price_main = na
+var float pct_gain_main = na
+
+// Create the box when EMA crosses up
+if ema_cross_up and enable_drawbuybox and showMACD 
+    if not na(uptrend_box)
+        box.delete(uptrend_box)
+    uptrend_box := box.new(left = bar_index,top = 100.0,right = bar_index,bottom = -100.0,bgcolor = buybox_color,border_color = border_buybox_color)
+    entry_price_main := close
+
+// Extend box while EMA stays above zero
+if not na(uptrend_box) and ema_scaled > 0
+    box.set_right(uptrend_box, bar_index)
+
+// When EMA crosses down, finalize the box and recolor it based on gain/loss
+if (ema_cross_down) and not na(uptrend_box) and showMACD 
+    exit_price_main := close
+    pct_gain_main := ((exit_price_main - entry_price_main) / entry_price_main) * 100
+
+    // Color based on % gain
+    box_color_main = pct_gain_main >= 0 ? color.new(color.lime, 80) : color.new(color.red, 80)
+    border_color_main = pct_gain_main >= 0 ? color.new(color.lime, 40) : color.new(color.red, 40)
+
+    box.set_bgcolor(uptrend_box, box_color_main)
+    box.set_border_color(uptrend_box, border_color_main)
+    box.set_right(uptrend_box, bar_index)
+
+    // Centered label showing gain %
+    mid_x = math.round((box.get_left(uptrend_box) + box.get_right(uptrend_box)) / 2)
+    label.new(x=mid_x, y=0, text=str.tostring(math.round(pct_gain_main, 2))+"%", style=label.style_label_center, color=color.new(color.black, 60), textcolor=color.white, yloc=yloc.price, size=size.normal)
+
+    // Reset
+    uptrend_box := na
+    entry_price_main := na
+    exit_price_main := na
+    pct_gain_main := na
+
+// === Draw trade boxes with % gain ===
+var box trade_box = na
+var int buy_bar = na
+var float buy_y = na
+var int sell_bar = na
+var float sell_y = na
+var float pct_gain = na  // <--- Added variable for later use
+
+if (ema_cross_up)  and enable_drawbuybox and showMACD 
+    buy_bar := bar_index
+    buy_y := low
+
+if ema_cross_down  and enable_drawbuybox and not na(buy_bar)
+    sell_bar := bar_index
+    sell_y := high 
+
+if not na(buy_bar) and not na(sell_bar)
+    lb = math.min(buy_bar, sell_bar)
+    rb = math.max(buy_bar, sell_bar)
+    topv = math.max(buy_y, sell_y)
+    botv = math.min(buy_y, sell_y)
+
+    // Calculate % gain
+    pct_gain := ((sell_y - buy_y) / buy_y) * 100
+
+    // Draw box with color depending on pct_gain
+    box_color = pct_gain >= 0 ? color.new(color.lime, 80) : color.new(color.red, 80)
+    trade_box := box.new(left=lb, top=topv, right=rb, bottom=botv, xloc=xloc.bar_index, bgcolor=box_color, border_color=color.new(border_buybox_color, 0), extend=extend.none, force_overlay=true)
+
+    // Add % label
+    label.new(x=(lb + rb)/2, y=(topv + botv)/2, text=str.tostring(math.round(pct_gain, 2)) + "%", style=label.style_label_center, color=color.new(color.black, 60), textcolor=color.white, size=size.normal, yloc=yloc.price, force_overlay=true)
+
+    // Reset bars
+    buy_bar := na
+    buy_y := na
+    sell_bar := na
+    sell_y := na
+
+
+// ---------------------- TRENDBOXES ------------------------------
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+// ~~ Tooltips {
+var string t1 = "Trigger Threshold: Controls when a new trend step is triggered. It's a multiplier of the ATR — higher values require a stronger price move to flip the trend direction."
+var string t2 = "Max Step Size: Defines the maximum allowed size for each trend step, based on ATR. Use a negative number to scale down large step jumps in volatile conditions."
+var string t3 = "Band Multiplier: Expands or contracts the volatility bands around the trend line. A higher value creates wider channels to account for more price fluctuation."
+var string t4 = "Trend Hold: After a trend flip, the trend will hold for this many bars before another flip can occur. Useful for avoiding rapid flip-flopping in choppy markets."
+var string t5 = "Retest Signals: Enables triangle markers on the chart when price re-tests the upper or lower channel boundary. Helpful for spotting potential continuation or bounce zones."
+var string t6 = "Trend Filter: Only show retest signals if they align with the current trend direction (e.g., only show upper retests in a downtrend)."
+var string t7 = "Trend Step Signals: Shows circular markers each time a new step is taken in the trend direction. These mark every structural trend advancement."
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Inputs {
+flipMult   = input.float(2.86,step=0.01, title="Trigger Threshold", group="", inline="", tooltip=t1)
+maxStepAtr = input.float(-0.034,step=0.001, title="Max Step Size", group="", inline="", tooltip=t2)
+bandMult   = input.float(2.02, step=0.01,title="Band Multiplier", group="", inline="", tooltip=t3)
+holdBars   = input.int(0, minval=0, title="Trend Hold", group="", inline="", tooltip=t4)
+
+trendbox_colorUp    = input.color(color.lime, title="Trendbox Color Up", group="", inline="c", tooltip="")
+trendbox_colorDown  = input.color(color.red, title="Trendbox Color Down", group="", inline="c", tooltip="")
+showFill   = input.bool(true, title="Channel Fill", group="", inline="c", tooltip="")
+
+ChannelRetestSignal = input.bool(true, title="Retest Signals", group="Retest Signals", inline="c22", tooltip=t5)
+TrendFilter  = input.bool(true, title="Filter by Trend", group="Retest Signals", inline="c222", tooltip=t6)
+colorUp2     = input.color(color.lime, title="", group="Retest Signals", inline="c2", tooltip="")
+colorDown2   = input.color(color.red, title="", group="Retest Signals", inline="c2", tooltip="")
+trendbox_transparency = input.int(50, minval=0, title="Trendbox Transparency", group="", inline="")
+
+TrendStepSignal = input.bool(false, title="Trend Step Signals", group="Trend Step Signals", inline="c33", tooltip=t7)
+colorUp3    = input.color(color.lime, title="", group="Trend Step Signals", inline="c3", tooltip="")
+colorDown3  = input.color(color.red, title="", group="Trend Step Signals", inline="c3", tooltip="")
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Atr Scaling {
+atr = ta.atr(200)
+stepBase = atr * 2.52
+maxStep  = atr * maxStepAtr
+trigger  = atr * flipMult
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Var {
+var float trend     = na
+var int dir         = 0
+var int barsInTrend = 0
+var float hold      = na
+var int extension   = 0
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Logic {
+startLong  = close > nz(trend) + trigger
+startShort = close < nz(trend) - trigger
+flip       = (startLong or startShort) and barsInTrend >= 0
+stepSize   = math.min(stepBase + 0.0093 * barsInTrend * atr, maxStep)
+
+if na(trend)
+    trend := close
+    dir := 0
+    barsInTrend := 0
+    hold := trigger
+    extension := 0
+else
+    if flip and extension <= 0
+        trend := close
+        dir := startLong ? 1 : -1
+        barsInTrend := 1
+        hold := trigger
+        extension := holdBars
+    else
+        trend := trend + (dir == 1 ? stepSize : dir == -1 ? -stepSize : 0)
+        barsInTrend += 1
+        extension := math.max(extension - 1, 0)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Channel {
+trendDirection = dir == 1 ? 1 : dir == -1 ? -1 : 0
+upper = trend + atr * bandMult
+lower = trend - atr * bandMult
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Plots {
+trendColor = dir == 1 ? trendbox_colorUp : dir == -1 ? trendbox_colorDown : color.gray
+trendStep  = (dir != 0) and (trend != trend[1]) and ((trend > trend[1] and dir == 1) or (trend < trend[1] and dir == -1))
+
+if not enable_trendbox or not showMACD 
+    trendColor := color.rgb(0,0,0,100)
+    
+
+
+plotMid    = plot(showMACD and showFill ?trend:na, "Trend Line", color=color.new(trendColor, trendbox_transparency/3), linewidth=1,force_overlay=true)
+plotUpper  = plot(showMACD and showFill ? upper : na, "Upper Band", color=color.new(trendColor, trendbox_transparency/3),force_overlay=true)
+plotLower  = plot(showMACD and showFill ? lower : na, "Lower Band", color=color.new(trendColor, trendbox_transparency/3),force_overlay=true)
+
+fill(plotUpper, plotMid, upper, trend,showFill ? color.new(trendColor, trendbox_transparency*1.5) : na,na)
+fill(plotLower, plotMid, lower, trend,showFill ? color.new(trendColor, trendbox_transparency*1.5) : na,na)
+
+Crossunder = ta.crossunder(low,lower)
+Crossover  = ta.crossover(high,upper)
+
+if TrendFilter 
+    Crossunder := ta.crossunder(low,lower) and trendDirection == 1
+    Crossover  := ta.crossover(high,upper) and trendDirection == -1
+
+plotshape(showMACD and Crossunder and ChannelRetestSignal and enable_trendbox?low:na, title="Lower Retest", color=colorUp2, style=shape.triangleup, size=size.tiny, location=location.belowbar,force_overlay=true)
+plotshape(showMACD and Crossover and ChannelRetestSignal and enable_trendbox?high:na, title="Upper Retest", color=colorDown2, style=shape.triangledown, size=size.tiny, location=location.abovebar,force_overlay=true)
+
+plotshape(showMACD  and trendStep and dir == 1 and TrendStepSignal  and enable_trendbox ?high:na, title="Bullish Step", location=location.absolute, style=shape.circle, color=colorUp3, size=size.tiny,force_overlay=true)
+plotshape(showMACD and trendStep and dir == -1 and TrendStepSignal  and enable_trendbox ?low:na, title="Bearish Step", location=location.absolute, style=shape.circle, color=colorDown3, size=size.tiny,force_overlay=true)
+plotshape(showMACD  and trendStep and dir == 1 and TrendStepSignal  and enable_trendbox?high:na, title="Bullish Step", location=location.absolute, style=shape.circle, color=color.new(colorUp3,50), size=size.small,force_overlay=true)
+plotshape(showMACD and trendStep and dir == -1 and TrendStepSignal  and enable_trendbox?low:na, title="Bearish Step", location=location.absolute, style=shape.circle, color=color.new(colorDown3,50), size=size.small,force_overlay=true)
+
+
+// This work is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International  
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Zeiierman {
+
+// indicator('Range Oscillator (Zeiierman)', overlay = false, precision = 1)
+//~~}
+
+// ~~ Tooltips {
+var string t12 = 'The minimum number of bars required to qualify a range box. A higher value ensures the range is well-established, but may reduce responsiveness.'
+var string t22 = 'Multiplier that adjusts the vertical size of the range box based on ATR. Larger values create wider boxes and accommodate higher volatility.'
+var string t42 = 'Number of horizontal levels (bands) used in the heatmap. More levels give finer granularity but may introduce noise.'
+var string t52 = 'Defines how many bars must touch a level to consider it \'hot\'. Lower values make the heatmap more reactive.'
+var string t62 = 'Color for strong bullish zones. Highlights areas where price faces less resistance in uptrends.'
+var string t72 = 'Color for strong bearish zones. Highlights areas where price faces less resistance in downtrends.'
+var string t82 = 'Color for weak bearish zones. Highlights pressure zones in downtrends.'
+var string t92 = 'Color for weak bullish zones. Highlights pressure zones in uptrends.'
+var string t102 = 'Color used during trend transitions or when no valid heatmap color is available.'
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Inputs {
+length = input.int(50, minval = 1, step = 1, title = 'Minimum Range Length', tooltip = t12, group = 'Range Oscillator')
+mult   = input.float(2.0, minval = 0.1, step = 0.1, title = 'Range Width Multiplier', tooltip = t22, group = 'Range Oscillator')
+
+levelsInp  = input.int(2, title = 'Number of Heat Levels', minval = 2, maxval = 100, group = 'Heat-map', tooltip = t42)
+heatThresh = input.int(1, title = 'Minimum Touches per Level', minval = 1, group = 'Heat-map', tooltip = t52)
+
+strongbullish  = input.color(#09ff00, title = 'Strong Bullish Color', group = 'Style', inline = 'c', tooltip = t62)
+strongbearish  = input.color(color.rgb(255, 0, 0), title = 'Strong Bearish Color', group = 'Style', inline = 'c1', tooltip = t72)
+weakbearish    = input.color(color.maroon, title = 'Weak Bearish Color', group = 'Style', inline = 'c1', tooltip = t72 + ' ' + ' ' + t82)
+weakbullish    = input.color(color.green, title = 'Weak Bullish Color', group = 'Style', inline = 'c', tooltip = t62 + ' ' + ' ' + t92)
+transitionzone = input.color(color.blue, title = 'Transition Color', group = 'Style', inline = 'c2', tooltip = t102)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Calculations {
+rangeATR = ta.atr(2000) * mult
+
+sumWeightedClose = 0.0
+sumWeights = 0.0
+for i = 0 to length - 1 by 1
+    delta = math.abs(close[i] - close[i + 1])
+    w = delta / close[i + 1]
+    sumWeightedClose := sumWeightedClose + close[i] * w
+    sumWeights := sumWeights + w
+    sumWeights
+ma = sumWeights != 0 ? sumWeightedClose / sumWeights : na
+
+distances = array.new_float(length)
+for i = 0 to length - 1 by 1
+    array.set(distances, i, math.abs(close[i] - ma))
+maxDist = array.max(distances)
+inRange = maxDist <= rangeATR
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Trend Direction for Heatmap {
+var int trendDir = 0
+trendDir := close > ma ? 1 : close < ma ? -1 : nz(trendDir[1])
+noColorOnFlip = trendDir != trendDir[1]
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Oscillator {
+osc = rangeATR != 0 ? 100 * (close - ma) / rangeATR : na
+
+blue = transitionzone
+green = strongbullish
+red = strongbearish
+heatColor = getHeatColor(osc, trendDir, levelsInp, heatThresh, weakbullish, strongbullish, weakbearish, strongbearish, osc, osc, true)
+oscColor = na(heatColor) or noColorOnFlip ? blue : heatColor
+
+breakUp = close > ma + rangeATR
+breakDn = close < ma - rangeATR
+oscColor := breakUp ? green : breakDn ? red : oscColor
+
+if enable_rangeosc == false
+    heatColor := color.rgb(0, 0, 0, 100)
+    oscColor := color.rgb(0, 0, 0, 100)
+
+osc_ = plot(showMACD ? osc: na, 'Range Oscillator', color = oscColor, linewidth = 2)
+hline(showMACD ? 100:na, 'Upper Bound', color = color.gray, linestyle = hline.style_dotted)
+hline(showMACD ? 0:na, 'Zero', color = color.gray, linestyle = hline.style_dotted)
+hline(showMACD ? -100:na, 'Lower Bound', color = color.gray, linestyle = hline.style_dotted)
+zero_ = plot(showMACD ? 0:na, '', display = display.none, editable = false)
+
+fill(osc_, zero_, ta.highest(osc, 100), 0, oscColor, color(na))
+fill(osc_, zero_, 0, ta.lowest(osc, 100), color(na), oscColor)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// modified by Nikko Oct 2025
+
+//indicator('RSI Divergence (Nikko) v3', overlay = false, max_lines_count = 500, calc_bars_count = 5000)
+
+// Ensure sufficient historical data
+
+displaySRSI = input.bool( title = 'Display Stochastic RSI', defval = true, group="Settings")
+if showMACD==true 
+    displaySRSI := false
+smoothK = input.int(3, "K", minval=1)
+smoothD = input.int(3, "D", minval=1)
+lengthRSI = input.int(14, "RSI Length", minval=1)
+lengthStoch = input.int(14, "Stochastic Length", minval=1)
+rsi_src = input(close, title="RSI Source")
+rsi1 = ta.rsi(rsi_src, lengthRSI)
+k = ta.sma(ta.stoch(rsi1, rsi1, rsi1, lengthStoch), smoothK)
+d = ta.sma(k, smoothD)
+
+h0 = hline(80, "Upper Band", color=#787B86)
+hline(50, "Middle Band", color=color.new(#787B86, 50))
+h1 = hline(20, "Lower Band", color=#787B86)
+fill(h0, h1, color=color.rgb(33, 150, 243, 90), title="Background")
+plot(displaySRSI and not showMACD? k : na, "K", color=#2962FF)
+plot(displaySRSI and not showMACD? d : na, "D", color=#FF6D00)
+
+// === INPUT PARAMETERS ===
+smaLengthInput = input.int(14, "SMA Length", group = "Settings", display = display.data_window)
+rsilen = input.int(14, title = 'rsi length')
+rsisrc = input(close, title = 'source')
+x = ta.rsi(rsisrc, rsilen) // RSI calculation
+ssma = ta.sma(rsisrc, rsilen)
+rsiPlot = x // save x for later
+// === COLOR SETTINGS ===
+groupColor = "🎨 Visual Settings"
+heatmapTransparency = input.int( title = 'Heatmap Transparency (0-100)', defval = 10, group=groupColor)
+colorRSI              = input.color(color.rgb(200, 200, 200, 0), title="RSI Default Color", group=groupColor)
+colorSMA              = input.color(color.rgb(200, 200, 0, 10), title="SMA Default Color", group=groupColor)
+colorRSIOverbought    = input.color(color.rgb(255, 0, 100, 0), title="RSI Overbought Color", group=groupColor)
+colorRSIOversold      = input.color(color.rgb(100, 255, 0, 10), title="RSI Oversold Color", group=groupColor)
+colorLabelBullish     = input.color(color.rgb(0, 87, 3, 0), title="Bullish Label Background", group=groupColor)
+colorLabelBearish     = input.color(color.rgb(102, 0, 0, 0), title="Bearish Label Background", group=groupColor)
+colorLabelText        = input.color(color.rgb(255, 255, 255, 0), title="Label Text Color", group=groupColor)
+colorLineBullishRSI   = input.color(color.rgb(0, 255, 0, 0), title="RSI Bullish Line", group=groupColor)
+colorLineBearishRSI   = input.color(color.rgb(255, 0, 0, 0), title="RSI Bearish Line", group=groupColor)
+colorLineBullishPrice = input.color(color.rgb(255, 0, 0, 0), title="Price Bullish Line", group=groupColor)
+colorLineBearishPrice = input.color(color.rgb(0, 255, 0, 0), title="Price Bearish Line", group=groupColor)
+colorBackground = input.color(color.rgb(52, 26, 67, 20), title="Flat Background color", group=groupColor)
+
+// Display options
+displaylabels = input.bool( title = 'Display Labels', defval = true, group="Settings")
+enableSMA = input.bool( title = 'Enable SMA', defval = true, group="Settings")
+hideHeatmap = input.bool(title = 'Hide Heatmap', defval= false, group="Settings")
+len = input.int(25, title = 'RSI Divergence length', maxval = 5000,minval = 1, group="Settings")
+divergencelinewidth = input.int( title = 'Divergeance Display Line Width', defval = 2, maxval=10, minval=1, group="Settings")
+rsilinewidth = input.int( title = 'RSI Display Line Width', defval = 1, maxval=10, minval=1, group="Settings")
+smalinewidth = input.int( title = 'SMA Display Line Width', defval = 2, maxval=10, minval=1, group="Settings")
+
+extrapolation = 0
+
+// === LINEAR REGRESSION FOR RSI ===
+xo = 0.0 // x average sum
+yo = 0.0 // y (RSI) average sum
+xyo = 0.0 // x*y cross-product sum
+xxo = 0.0 // x*x sum
+for i = 0 to len - 1 by 1
+    xo := xo + i / len
+    yo := yo + x[len - 1 - i] / len
+    xyo := xyo + i * x[len - 1 - i] / len
+    xxo := xxo + i * i / len
+    xxo
+
+// Store lowest low for reference
+lowBound = ta.lowest(low, 200)
+
+// Create RSI trend line values
+rsiFitArray = array.new_float(len * 2 + 1 + extrapolation)
+rsiLineArray = array.new_line()
+a = (xo * yo - xyo) / (xo * xo - xxo)
+b = yo - a * xo
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(rsiFitArray, i, a * i + b)
+
+//// === LINEAR REGRESSION FOR PRICE ===
+mo = 0.0 // Average volatility
+xo2 = 0.0
+yo2 = 0.0
+xyo2 = 0.0
+xxo2 = 0.0
+for i = 0 to len - 1 by 1
+    mo := mo + (high[len - 1 - i]-low[len - 1 - i]) / len
+    xo2 := xo2 + i / len
+    yo2 := yo2 + rsi_src[len - 1 - i] / len
+    xyo2 := xyo2 + i * rsi_src[len - 1 - i] / len
+    xxo2 := xxo2 + i * i / len
+    xxo2
+
+priceFitArray = array.new_float(len * 2 + 1 + extrapolation)
+priceLineArray = array.new_line()
+a2 = (xo2 * yo2 - xyo2) / (xo2 * xo2 - xxo2)
+b2 = yo2 - a * xo2
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(priceFitArray, i, a2 * i + b2)
+
+// === DIVERGENCE CHECK ===
+ttk = array.get(rsiFitArray, 0) < array.get(rsiFitArray, 1) and array.get(priceFitArray, 0) > array.get(priceFitArray, 1) ? 1 : array.get(rsiFitArray, 0) > array.get(rsiFitArray, 1) and array.get(priceFitArray, 0) < array.get(priceFitArray, 1) ? -1 : 0
+
+// Check for bullish and bearish divergence conditions
+cg = array.get(rsiFitArray, 0) < array.get(rsiFitArray, 1) and array.get(priceFitArray, 0) > array.get(priceFitArray, 1)
+cr = array.get(rsiFitArray, 0) > array.get(rsiFitArray, 1) and array.get(priceFitArray, 0) < array.get(priceFitArray, 1)
+
+// Confirm strength of divergence
+cr := cr and  array.get(priceFitArray, 0) - array.get(priceFitArray, 24) < -mo and array.get(rsiFitArray, 0) - array.get(rsiFitArray, 24) > 5
+cg := cg and array.get(priceFitArray, 0) - array.get(priceFitArray, 24) > mo and array.get(rsiFitArray, 0) - array.get(rsiFitArray, 24) < -5
+
+// === RSI PLOT ===
+plotcolor=colorRSI
+if (x>=70)
+    plotcolor:=colorRSIOverbought
+if (x<=30)
+    plotcolor:=colorRSIOversold
+
+if x<80 and x>20
+    plotcolor:=colorRSI
+
+plot(not showMACD ? x : na, color = plotcolor, linewidth=rsilinewidth)    
+
+// Plot SMA
+smoothingSMA = enableSMA ? ta.sma(x, smaLengthInput) : na
+plot(not showMACD ? smoothingSMA:na, "RSI-based MA", color= colorSMA, display = enableSMA ? display.all : display.none, editable = enableSMA, linewidth=smalinewidth)
+
+
+// === SECOND REGRESSION LINES FOR PLOTTING ===
+// These capture the detected divergences visually with updated trend lines
+// Bullish
+xo3 = 0.0
+yo3 = 0.0
+xyo3 = 0.0
+xxo3 = 0.0
+for i = 0 to len - 1 by 1
+    xo3 := xo3 + i / len
+    yo3 := yo3 + x[len - 1 - i + ta.barssince(cg)] / len
+    xyo3 := xyo3 + i * x[len - 1 - i + ta.barssince(cg)] / len
+    xxo3 := xxo3 + i * i / len
+    xxo3
+
+dizi3 = array.new_float(len * 2 + 1 + extrapolation)
+linedizi3 = array.new_line()
+a3 = (xo3 * yo3 - xyo3) / (xo3 * xo3 - xxo3)
+b3 = yo3 - a3 * xo3
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(dizi3, i, a3 * i + b3)
+
+// Bearish
+xo4 = 0.0
+yo4 = 0.0
+xyo4 = 0.0
+xxo4 = 0.0
+for i = 0 to len - 1 by 1
+    xo4 := xo4 + i / len
+    yo4 := yo4 + x[len - 1 - i + ta.barssince(cr)] / len
+    xyo4 := xyo4 + i * x[len - 1 - i + ta.barssince(cr)] / len
+    xxo4 := xxo4 + i * i / len
+    xxo4
+
+dizi4 = array.new_float(len * 2 + 1 + extrapolation)
+linedizi4 = array.new_line()
+a4 = (xo4 * yo4 - xyo4) / (xo4 * xo4 - xxo4)
+b4 = yo4 - a4 * xo4
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(dizi4, i, a4 * i + b4)
+
+// Prevent repeated signals in the same window
+for i = 0 to len-1
+    cg:= cg and not cg[i+1]
+    cr:= cr and not cr[i+1]
+
+// === DRAW SIGNALS AND ALERTS ===
+if not showMACD and cg
+    line.new(ta.valuewhen(cg, bar_index, 0) - len +1, ta.valuewhen(cg, array.get(dizi3, 0), 0), ta.valuewhen(cg, bar_index, 0), ta.valuewhen(cg, array.get(dizi3, len - 1), 0), color = colorLineBullishRSI, width = divergencelinewidth)
+    alert("Positive \nDivergence", alert.freq_once_per_bar_close)
+    if displaylabels
+        label.new(bar_index,close, "Bullish", xloc.bar_index, yloc.belowbar, colorLabelBullish, label.style_label_up, colorLabelText, size.normal, text.align_center, na, font.family_default, true)    
+
+if not showMACD and cr 
+    line.new(ta.valuewhen(cr, bar_index, 0) - len +1, ta.valuewhen(cr, array.get(dizi4, 0), 0), ta.valuewhen(cr, bar_index, 0), ta.valuewhen(cr, array.get(dizi4, len - 1), 0), color = colorLineBearishRSI, width = divergencelinewidth)
+    alert("Negative \nDivergence", alert.freq_once_per_bar_close)    
+    if displaylabels 
+        label.new(bar_index,close, "Bearish", xloc.bar_index, yloc.abovebar, colorLabelBearish, label.style_label_down, colorLabelText, size.normal, text.align_center, na, font.family_default, true)
+
+// === ALERT CONDITIONS ===
+alertcondition(cg, title = 'Nikko RSI Buy')
+alertcondition( cr, title = 'Nikko RSI Sell')
+
+// === RSI BACKGROUND PLOT ===
+hline(not showMACD ? 50: na, color = color.new(#787B86, 0))
+rs70 = hline(70)
+rs30 = hline(30)
+rs100 = hline(80) 
+rs0 = hline(20) 
+
+gbHeatmapColor = color.rgb( 100-x,x, x/2, heatmapTransparency)
+gbHeatmapColorTop = color.rgb( 100-x,x, x/2, 100)
+gbHeatmapColorBottom = color.rgb( 100-x,x, x/2, 100)
+if (hideHeatmap==true)
+    gbHeatmapColor := colorBackground     
+        
+if rsiPlot>=70 and not showMACD   
+    gbHeatmapColorTop := color.rgb(255,0,0,100-((rsiPlot-70) *3) )
+if rsiPlot<=30  and not showMACD
+    gbHeatmapColorBottom := color.rgb(0,255,0,((rsiPlot) *3))
+
+
+fill(rs70, rs100, color= gbHeatmapColorTop, title = 'Background Fill')
+fill(rs30, rs70, color= gbHeatmapColor, title = 'Background Fill')
+fill(rs0, rs30, color= gbHeatmapColorBottom, title = 'Background Fill')
+
+
+// === FINAL LINES FOR PRICE PROJECTIONS (OVERLAY LINES) ===
+xo5 = 0.0
+yo5 = 0.0
+xyo5 = 0.0
+xxo5 = 0.0
+for i = 0 to len - 1 by 1
+    xo5 := xo5 + i / len
+    yo5 := yo5 + rsi_src[len - 1 - i + ta.barssince(cg)] / len
+    xyo5 := xyo5 + i * rsi_src[len - 1 - i + ta.barssince(cg)] / len
+    xxo5 := xxo5 + i * i / len
+    xxo5
+
+dizi5 = array.new_float(len * 2 + 1 + extrapolation)
+linedizi5 = array.new_line()
+a5 = (xo5 * yo5 - xyo5) / (xo5 * xo5 - xxo5)
+b5 = yo5 - a5 * xo5
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(dizi5, i, a5 * i + b5)
+
+// divbergeance in overlay
+if not showMACD and cg
+    line.new(ta.valuewhen(cg, bar_index, 0) - len +1, ta.valuewhen(cg, array.get(dizi5, 0), 0), ta.valuewhen(cg, bar_index, 0), ta.valuewhen(cg, array.get(dizi5, len - 1), 0), color = colorLineBearishPrice, width = divergencelinewidth, force_overlay = true)
+
+xo6 = 0.0
+yo6 = 0.0
+xyo6 = 0.0
+xxo6 = 0.0
+for i = 0 to len - 1 by 1
+    xo6 := xo6 + i / len
+    yo6 := yo6 + rsi_src[len - 1 - i + ta.barssince(cr)] / len
+    xyo6 := xyo6 + i * rsi_src[len - 1 - i + ta.barssince(cr)] / len
+    xxo6 := xxo6 + i * i / len
+    xxo6
+
+dizi6 = array.new_float(len * 2 + 1 + extrapolation)
+linedizi6 = array.new_line()
+a6 = (xo6 * yo6 - xyo6) / (xo6 * xo6 - xxo6)
+b6 = yo6 - a6 * xo6
+for i = 0 to len - 1 + extrapolation by 1
+    array.set(dizi6, i, a6 * i + b6)
+
+// divergence in overlay
+if not showMACD and cr
+    line.new(ta.valuewhen(cr, bar_index, 0) - len +1, ta.valuewhen(cr, array.get(dizi6, 0), 0), ta.valuewhen(cr, bar_index, 0), ta.valuewhen(cr, array.get(dizi6, len - 1), 0), color = colorLineBullishPrice, width = divergencelinewidth, force_overlay = true)
+
