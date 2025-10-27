@@ -1,5 +1,5 @@
 //@version=6
-indicator("MTF MACD + RSI (Nikko) v1 Private", overlay=false, max_lines_count=500, calc_bars_count=5000)
+indicator("MTF MACD + RSI (Nikko) v1.1 Private", overlay=false, max_lines_count=500, calc_bars_count=5000)
 
 max_bars_back(time,500)
 
@@ -107,15 +107,22 @@ tf_1w  = input.timeframe("1W", "1W Timeframe")
 // adjust in the settings to optimize the exit point of the ema above or below the 0 line
 exit_ema_thresold  = input.float(0.0, "Exit EMA threashold (ajust to coin)")
 
-// Enable/disable each timeframe
-enable_15m = input.bool(false, "Enable 15m Background")
-enable_1h  = input.bool(true, "Enable 1H")
-enable_1d  = input.bool(true, "Enable 1D")
-enable_1w  = input.bool(true, "Enable 1W")
-enable_background = input.bool(true, "Enable Background")
-enable_drawbuybox = input.bool(true, "Draw Buy Box")
-enable_trendbox = input.bool(false, "Draw Trendbox")
-enable_rangeosc = input.bool(false, "Draw Range Oscillator")
+// Enable/disable each timeframe for the MACD part
+enable_15m = input.bool(false, "Enable 15m Background", group="MACD")
+enable_1h  = input.bool(true, "Enable 1H", group="MACD")
+enable_1d  = input.bool(true, "Enable 1D", group="MACD")
+enable_1w  = input.bool(true, "Enable 1W", group="MACD")
+enable_background = input.bool(true, "Enable Background", group="MACD")
+enable_drawbuybox = input.bool(true, "Draw Buy Box in the MACD", group="MACD")
+enable_trendbox = input.bool(false, "Draw Trendbox in the MACD", group="MACD")
+enable_rangeosc = input.bool(false, "Draw Range Oscillator in the MACD", group="MACD")
+
+// for the RSI Part
+enable_vwap = input.bool(false, "Draw the VWAP in the RSI pane", group="RSI")
+// Toggle shapes
+show_threshold_shapes = input.bool(true, "Show Threshold Buy/Sell Shapes",  group="RSI")
+show_rsi_div          = input.bool(true, "Show RSI Divergence Shapes", group="RSI")
+
 
 // Visual settings
 buysell_linewidth  = input.int(5, "Buy/Sell Line Width")
@@ -128,9 +135,6 @@ threshold_high     = input.float(90.0, "Upper Threshold (%)")
 signal_lookback    = input.int(50, "Lookback Period")
 Background_transparency = input.int(75, "Background Transparency (%)")
 
-// Toggle shapes
-show_threshold_shapes = input.bool(true, "Show Threshold Buy/Sell Shapes")
-show_rsi_div          = input.bool(true, "Show RSI Divergence Shapes")
 
     // ================= CALCULATIONS =================
 
@@ -528,7 +532,8 @@ transitionzone = input.color(color.blue, title = 'Transition Color', group = 'St
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
 
 // ~~ Calculations {
-rangeATR = ta.atr(2000) * mult
+atrRaw   = nz(ta.atr(2000), ta.atr(200))
+rangeATR = atrRaw * mult
 
 sumWeightedClose = 0.0
 sumWeights = 0.0
@@ -776,10 +781,10 @@ alertcondition( cr, title = 'Nikko RSI Sell')
 
 // === RSI BACKGROUND PLOT ===
 hline(not showMACD ? 50: na, color = color.new(#787B86, 0))
-rs70 = hline(70)
-rs30 = hline(30)
-rs100 = hline(80) 
-rs0 = hline(20) 
+rs70 = hline(not showMACD ? 70: na)
+rs30 = hline(not showMACD ? 30: na)
+rs100 = hline(not showMACD ? 80: na) 
+rs0 = hline(not showMACD ? 20: na) 
 
 gbHeatmapColor = color.rgb( 100-x,x, x/2, heatmapTransparency)
 gbHeatmapColorTop = color.rgb( 100-x,x, x/2, 100)
@@ -843,3 +848,129 @@ for i = 0 to len - 1 + extrapolation by 1
 if not showMACD and cr
     line.new(ta.valuewhen(cr, bar_index, 0) - len +1, ta.valuewhen(cr, array.get(dizi6, 0), 0), ta.valuewhen(cr, bar_index, 0), ta.valuewhen(cr, array.get(dizi6, len - 1), 0), color = colorLineBullishPrice, width = divergencelinewidth, force_overlay = true)
 
+
+// VWAP --------------------------------------------------------------------------------
+
+// ~~ Tooltips {
+var string t1x = "Number of bars used to detect swing highs and lows. Larger values identify bigger, more significant swings but react slower. Smaller values detect more frequent swings but may produce more noise."
+var string t2x = "Controls how quickly the VWAP adjusts to new price action. Lower values make the VWAP react faster (tighter to price), higher values make it smoother and slower to change."
+var string t3x = "When enabled, the VWAP reaction speed changes automatically based on market volatility. High volatility shortens the tracking period (more responsive), low volatility lengthens it (smoother)."
+var string t4x = "Controls how strongly volatility influences the VWAP reaction speed. Values above 1 increase the effect of volatility changes; values below 1 make it less sensitive to volatility."
+var string t5x = "Color used for swing high/low labels drawn on the chart to indicate pivot points."
+var string t6x = "Color used for swing low labels when marking pivot points."
+var string t7x = "Color used for VWAP lines when in an uptrend."
+var string t8x = "Color used for VWAP lines when in a downtrend."
+var string t9x = "Width of the VWAP lines drawn on the chart. Larger values make the lines thicker and more visible."
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Inputs {
+prd     = input.int(50, title='Swing Period', minval=2, group='Swing Points', tooltip=t1x)
+baseAPT = input.float(20, 'Adaptive Price Tracking', minval=1, step=1, group='Swing Points', tooltip=t2x)
+useAdapt = input.bool(false, 'Adapt APT by ATR ratio', group='Swing Points', tooltip=t3x)
+volBias = input.float(10.0, 'Volatility Bias', minval=0.1, step=0.1, group='Swing Points', tooltip=t4x)
+
+highS   = input.color(color.lime, title="Swing Labels", group="Style", inline="Swing", tooltip=t5x)
+lowS    = input.color(color.red, title="", group="Style", inline="Swing", tooltip=t6x)
+R_vwap       = input.color(color.lime, title="VWAP Lines", group="Style", inline="VWAP", tooltip=t7x)
+S_vwap       = input.color(color.red,  title="", group="Style", inline="VWAP", tooltip=t8x)
+xx_vwap      = input.int(2, minval=1, title="", group="Style", inline="VWAP", tooltip=t9x)
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Global Variable {
+b_vwap = bar_index
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ PIVOTS Variables {
+var ph   = float(na)
+var pl   = float(na)
+var phL  = b_vwap
+var plL  = b_vwap
+var lab  = label(na)
+var prev = float(na)
+
+ph  := ta.highestbars(high, prd) == 0 ? high : ph
+pl  := ta.lowestbars(low,  prd) == 0 ? low  : pl
+phL := ta.highestbars(high, prd) == 0 ? b_vwap   : phL
+plL := ta.lowestbars(low,  prd) == 0 ? b_vwap    : plL
+dir_vwap = phL > plL ? 1 : -1
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Adaptation {
+atrLen = 50
+atr_vwap    = ta.atr(atrLen)
+atrAvg = ta.rma(atr_vwap, atrLen)
+ratio  = atrAvg > 0 ? atr / atrAvg : 1.0
+
+aptRaw     = useAdapt ? baseAPT / math.pow(ratio, volBias) : baseAPT
+aptClamped = math.max(5.0, math.min(300.0, aptRaw))
+aptSeries  = math.round(aptClamped)
+
+// alpha from APT (half-life -> EWMA alpha)
+alphaFromAPT(apt) =>
+    decay = math.exp(-math.log(2.0) / math.max(1.0, apt))
+    1.0 - decay
+
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+// Dynamic VWAP 
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+// ~~ VWAP Variables {
+var p_vwap   = hlc3 * volume 
+var vol_vwap = volume      
+
+type dataPoints
+    array<chart.point> points
+    polyline poly = na
+
+var vwap = dataPoints.new(array.new<chart.point>())
+//~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~}
+
+// ~~ Main {
+if dir_vwap != dir_vwap[1]
+    x_vwap   = dir_vwap > 0 ? plL : phL
+    y_vwap   = dir_vwap > 0 ? pl  : ph
+    loc = dir_vwap > 0 ? label.style_label_up : label.style_label_down
+    col = dir_vwap > 0 ?  highS : lowS
+    txt = dir_vwap > 0 and pl < prev ? 'LL' : dir_vwap > 0 and pl > prev ? 'HL' : dir_vwap < 0 and ph < prev ? 'LH' : dir_vwap < 0 and ph > prev ? 'HH' : ''
+    if not showMACD and enable_vwap 
+        label.new(x_vwap, y_vwap, text=txt, style=loc, color=color.new(col, 20), textcolor=color.white, force_overlay = true)
+    prev := dir_vwap > 0 ? ph[1] : pl[1]
+
+    barsback = b_vwap - x_vwap
+    p_vwap   := y_vwap * volume[barsback]
+    vol_vwap := volume[barsback]
+    vap = p_vwap / vol_vwap
+
+    vwap.poly.delete()
+    polyline.new(not showMACD and enable_vwap ? vwap.points:na, false, false, line_color = dir_vwap < 0 ? R_vwap : S_vwap, line_width = xx_vwap, force_overlay = true)
+    vwap.points.clear()
+
+    for i_vwap = barsback to 0 by 1
+        apt_i = aptSeries[i_vwap]
+        alpha = alphaFromAPT(apt_i)
+
+        pxv   = hlc3[i_vwap] * volume[i_vwap]
+        v_i   = volume[i_vwap]
+
+        p_vwap     := (1.0 - alpha) * p_vwap + alpha * pxv
+        vol_vwap   := (1.0 - alpha) * vol_vwap + alpha * v_i
+        vappe = vol_vwap > 0 ? p_vwap / vol_vwap : na
+
+        vwap.points.push(chart.point.from_index(b_vwap - i_vwap, vappe))
+
+    vwap.poly := polyline.new(not showMACD and enable_vwap ? vwap.points : na, false, false, line_color = dir_vwap < 0 ? R_vwap : S_vwap, line_width = xx_vwap, force_overlay = true)
+
+else
+    apt_0 = aptSeries
+    alpha = alphaFromAPT(apt_0)
+
+    pxv = hlc3 * volume
+    v0  = volume
+
+    p_vwap   := (1.0 - alpha) * p_vwap + alpha * pxv
+    vol_vwap := (1.0 - alpha) * vol_vwap + alpha * v0
+    vap = vol_vwap > 0 ? p_vwap / vol_vwap : na
+
+    vwap.poly.delete()
+    vwap.points.push(chart.point.from_index(b_vwap, vap))
+    vwap.poly := polyline.new(not showMACD and enable_vwap ? vwap.points : na, false, false, line_color = dir_vwap > 0 ? R_vwap : S_vwap, line_width = xx_vwap, force_overlay = true)
+//~~ }
